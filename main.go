@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"github.com/acheong08/OpenAIAuth/auth"
 	"log"
@@ -26,21 +27,28 @@ func requestToken(w http.ResponseWriter, r *http.Request) {
 func getToken(username string, password string) string {
 	auth := auth.NewAuthenticator(username, password, os.Getenv("PROXY"))
 	err := auth.Begin()
-	if err.Error != nil {
+	if err != nil {
 		println("Error: " + err.Details)
 		println("Location: " + err.Location)
 		println("Status code: " + fmt.Sprint(err.StatusCode))
 		println("Embedded error: " + err.Error.Error())
 		return fmt.Sprint("ERROR: ", err.Error.Error())
 	}
-	token, err := auth.GetAccessToken()
-	if err.Error != nil {
+	// if os.Getenv("PROXY") != "" {
+	puid, err := auth.GetPUID()
+	if err != nil {
 		println("Error: " + err.Details)
 		println("Location: " + err.Location)
 		println("Status code: " + fmt.Sprint(err.StatusCode))
 		println("Embedded error: " + err.Error.Error())
 		return fmt.Sprint("ERROR: ", err.Error.Error())
 	}
+	println("PUID: " + puid)
+	// }
+	// JSON encode auth.GetAuthResult()
+	result := auth.GetAuthResult()
+	result_json, _ := json.Marshal(result)
+	println(string(result_json))
 	return token
 }
 

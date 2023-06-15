@@ -2,6 +2,7 @@ package auth
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -9,8 +10,11 @@ import (
 	"regexp"
 	"strings"
 
+	"crypto/rand"
+
 	http "github.com/bogdanfinn/fhttp"
 	tls_client "github.com/bogdanfinn/tls-client"
+	pkce "github.com/nirasan/go-oauth-pkce-code-verifier"
 )
 
 type Error struct {
@@ -30,12 +34,53 @@ func NewError(location string, statusCode int, details string, err error) *Error
 }
 
 type Authenticator struct {
-	EmailAddress string
-	Password     string
-	Proxy        string
-	Session      tls_client.HttpClient
-	AccessToken  string
-	UserAgent    string
+	EmailAddress       string
+	Password           string
+	Proxy              string
+	Session            tls_client.HttpClient
+	UserAgent          string
+	State              string
+	URL                string
+	Verifier_code      string
+	Verifier_challenge string
+	AuthRequest        AuthRequest
+	AuthResult         AuthResult
+}
+
+type AuthRequest struct {
+	ClientID            string `json:"client_id"`
+	Scope               string `json:"scope"`
+	ResponseType        string `json:"response_type"`
+	RedirectURL         string `json:"redirect_url"`
+	Audience            string `json:"audience"`
+	Prompt              string `json:"prompt"`
+	State               string `json:"state"`
+	CodeChallenge       string `json:"code_challenge"`
+	CodeChallengeMethod string `json:"code_challenge_method"`
+}
+
+type AuthResult struct {
+	AccessToken  string `json:"access_token"`
+	RefreshToken string `json:"refresh_token"`
+	PUID         string `json:"puid"`
+}
+
+func NewAuthDetails(challenge string) AuthRequest {
+	// Generate state (secrets.token_urlsafe(32))
+	b := make([]byte, 32)
+	rand.Read(b)
+	state := base64.URLEncoding.EncodeToString(b)
+	return AuthRequest{
+		ClientID:            "pdlLIX2Y72MIl2rhLhTE9VV9bN905kBh",
+		Scope:               "openid email profile offline_access model.request model.read organization.read",
+		ResponseType:        "code",
+		RedirectURL:         "com.openai.chat://auth0.openai.com/ios/com.openai.chat/callback",
+		Audience:            "https://api.openai.com/v1",
+		Prompt:              "login",
+		State:               state,
+		CodeChallenge:       challenge,
+		CodeChallengeMethod: "S256",
+	}
 }
 
 func NewAuthenticator(emailAddress, password, proxy string) *Authenticator {
@@ -43,18 +88,26 @@ func NewAuthenticator(emailAddress, password, proxy string) *Authenticator {
 		EmailAddress: emailAddress,
 		Password:     password,
 		Proxy:        proxy,
-		UserAgent:    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Safari/537.36",
+		UserAgent:    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/109.0.0.0 Safari/537.36",
 	}
 	jar := tls_client.NewCookieJar()
 	options := []tls_client.HttpClientOption{
 		tls_client.WithTimeoutSeconds(20),
-		tls_client.WithClientProfile(tls_client.Chrome_110),
+		tls_client.WithClientProfile(tls_client.Firefox_102),
 		tls_client.WithNotFollowRedirects(),
 		tls_client.WithCookieJar(jar), // create cookieJar instance and pass it as argument
 		// Proxy
 		tls_client.WithProxyUrl(proxy),
 	}
 	auth.Session, _ = tls_client.NewHttpClient(tls_client.NewNoopLogger(), options...)
+
+	// PKCE
+	verifier, _ := pkce.CreateCodeVerifier()
+	auth.Verifier_code = verifier.String()
+	auth.Verifier_challenge = verifier.CodeChallengeS256()
+
+	auth.AuthRequest = NewAuthDetails(auth.Verifier_challenge)
+
 	return auth
 }
 
@@ -62,56 +115,15 @@ func (auth *Authenticator) URLEncode(str string) string {
 	return url.QueryEscape(str)
 }
 
-func (auth *Authenticator) Begin() Error {
+func (auth *Authenticator) Begin() *Error {
+	// Just realized that the client id is hardcoded in the JS file
 
-	url := "https://chat.openai.com/api/auth/csrf"
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return *NewError("begin", 0, "", err)
-	}
-
-	req.Header.Set("Host", "chat.openai.com")
-	req.Header.Set("Accept", "*/*")
-	req.Header.Set("Connection", "keep-alive")
-	req.Header.Set("User-Agent", auth.UserAgent)
-	req.Header.Set("Accept-Language", "en-GB,en-US;q=0.9,en;q=0.8")
-	req.Header.Set("Referer", "https://chat.openai.com/auth/login")
-	req.Header.Set("Accept-Encoding", "gzip, deflate, br")
-
-	resp, err := auth.Session.Do(req)
-	if err != nil {
-		return *NewError("begin", 0, "", err)
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return *NewError("begin", 0, "", err)
-	}
-
-	if resp.StatusCode == 200 && strings.Contains(resp.Header.Get("Content-Type"), "json") {
-
-		var csrfTokenResponse struct {
-			CsrfToken string `json:"csrfToken"`
-		}
-		err = json.Unmarshal(body, &csrfTokenResponse)
-		if err != nil {
-			return *NewError("begin", 0, "", err)
-		}
-
-		csrfToken := csrfTokenResponse.CsrfToken
-		return auth.partOne(csrfToken)
-	} else {
-		err := NewError("begin", resp.StatusCode, string(body), fmt.Errorf("error: Check details"))
-		return *err
-	}
+	return auth.partOne()
 }
-func (auth *Authenticator) partOne(token string) Error {
+func (auth *Authenticator) partOne() *Error {
 
-	url := "https://chat.openai.com/api/auth/signin/auth0?prompt=login"
-	payload := fmt.Sprintf("callbackUrl=%%2F&csrfToken=%s&json=true", token)
+	auth_url := "https://auth0.openai.com/authorize"
 	headers := map[string]string{
-		"Host":            "chat.openai.com",
 		"User-Agent":      auth.UserAgent,
 		"Content-Type":    "application/x-www-form-urlencoded",
 		"Accept":          "*/*",
@@ -124,11 +136,20 @@ func (auth *Authenticator) partOne(token string) Error {
 		"Referer":         "https://chat.openai.com/auth/login",
 		"Accept-Encoding": "gzip, deflate",
 	}
-
-	req, err := http.NewRequest("POST", url, strings.NewReader(payload))
-	if err != nil {
-		return *NewError("part_one", 0, "", err)
+	// Construct payload
+	payload := url.Values{
+		"client_id":             {auth.AuthRequest.ClientID},
+		"scope":                 {auth.AuthRequest.Scope},
+		"response_type":         {auth.AuthRequest.ResponseType},
+		"redirect_uri":          {auth.AuthRequest.RedirectURL},
+		"audience":              {auth.AuthRequest.Audience},
+		"prompt":                {auth.AuthRequest.Prompt},
+		"state":                 {auth.AuthRequest.State},
+		"code_challenge":        {auth.AuthRequest.CodeChallenge},
+		"code_challenge_method": {auth.AuthRequest.CodeChallengeMethod},
 	}
+	auth_url = auth_url + "?" + payload.Encode()
+	req, _ := http.NewRequest("GET", auth_url, nil)
 
 	for k, v := range headers {
 		req.Header.Set(k, v)
@@ -136,38 +157,22 @@ func (auth *Authenticator) partOne(token string) Error {
 
 	resp, err := auth.Session.Do(req)
 	if err != nil {
-		return *NewError("part_one", 0, "", err)
+		return NewError("part_one", 0, "Failed to send request", err)
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return *NewError("part_one", 0, "", err)
+		return NewError("part_one", 0, "Failed to read body", err)
 	}
 
-	if resp.StatusCode == 200 && strings.Contains(resp.Header.Get("Content-Type"), "json") {
-
-		var urlResponse struct {
-			URL string `json:"url"`
-		}
-		err = json.Unmarshal(body, &urlResponse)
-		if err != nil {
-			return *NewError("part_one", 0, "", err)
-		}
-
-		url := urlResponse.URL
-		if url == "https://chat.openai.com/api/auth/error?error=OAuthSignin" || strings.Contains(url, "error") {
-			err := NewError("part_one", resp.StatusCode, "You have been rate limited. Please try again later.", fmt.Errorf("error: Check details"))
-			return *err
-		}
-
-		return auth.partTwo(url)
+	if resp.StatusCode == 302 {
+		return auth.partTwo("https://auth0.openai.com" + resp.Header.Get("Location"))
 	} else {
-		err := NewError("part_one", resp.StatusCode, string(body), fmt.Errorf("error: Check details"))
-		return *err
+		return NewError("part_one", resp.StatusCode, string(body), fmt.Errorf("error: Check details"))
 	}
 }
 
-func (auth *Authenticator) partTwo(url string) Error {
+func (auth *Authenticator) partTwo(url string) *Error {
 
 	headers := map[string]string{
 		"Host":            "auth0.openai.com",
@@ -175,86 +180,37 @@ func (auth *Authenticator) partTwo(url string) Error {
 		"Connection":      "keep-alive",
 		"User-Agent":      auth.UserAgent,
 		"Accept-Language": "en-US,en;q=0.9",
-		"Referer":         "https://chat.openai.com/",
+		"Referer":         "https://ios.chat.openai.com/",
 	}
 
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return *NewError("part_two", 0, "", err)
-	}
-
+	req, _ := http.NewRequest("GET", url, nil)
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
 
 	resp, err := auth.Session.Do(req)
 	if err != nil {
-		return *NewError("part_two", 0, "", err)
+		return NewError("part_two", 0, "Failed to make request", err)
 	}
 	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return *NewError("part_two", 0, "", err)
-	}
+	body, _ := io.ReadAll(resp.Body)
 
 	if resp.StatusCode == 302 || resp.StatusCode == 200 {
 
 		stateRegex := regexp.MustCompile(`state=(.*)`)
 		stateMatch := stateRegex.FindStringSubmatch(string(body))
 		if len(stateMatch) < 2 {
-			return *NewError("part_two", 0, "Could not find state in response", fmt.Errorf("error: Check details"))
+			return NewError("part_two", 0, "Could not find state in response", fmt.Errorf("error: Check details"))
 		}
 
 		state := strings.Split(stateMatch[1], `"`)[0]
 		return auth.partThree(state)
 	} else {
-		err := NewError("__part_two", resp.StatusCode, string(body), fmt.Errorf("error: Check details"))
-		return *err
+		return NewError("__part_two", resp.StatusCode, string(body), fmt.Errorf("error: Check details"))
+
 	}
 }
-
-func (auth *Authenticator) partThree(state string) Error {
-
-	url := fmt.Sprintf("https://auth0.openai.com/u/login/identifier?state=%s", state)
-
-	headers := map[string]string{
-		"Host":            "auth0.openai.com",
-		"Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-		"Connection":      "keep-alive",
-		"User-Agent":      auth.UserAgent,
-		"Accept-Language": "en-US,en;q=0.9",
-		"Referer":         "https://chat.openai.com/",
-	}
-
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return *NewError("part_three", 0, "", err)
-	}
-
-	for k, v := range headers {
-		req.Header.Set(k, v)
-	}
-
-	resp, err := auth.Session.Do(req)
-	if err != nil {
-		return *NewError("part_three", 0, "", err)
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return *NewError("part_three", 0, "", err)
-	}
-
-	if resp.StatusCode == 200 {
-		return auth.partFour(state)
-	} else {
-		err := NewError("__part_three", resp.StatusCode, string(body), fmt.Errorf("error: Check details"))
-		return *err
-	}
-
-}
-func (auth *Authenticator) partFour(state string) Error {
+func (auth *Authenticator) partThree(state string) *Error {
 
 	url := fmt.Sprintf("https://auth0.openai.com/u/login/identifier?state=%s", state)
 	emailURLEncoded := auth.URLEncode(auth.EmailAddress)
@@ -275,10 +231,7 @@ func (auth *Authenticator) partFour(state string) Error {
 		"Content-Type":    "application/x-www-form-urlencoded",
 	}
 
-	req, err := http.NewRequest("POST", url, strings.NewReader(payload))
-	if err != nil {
-		return *NewError("part_four", 0, "", err)
-	}
+	req, _ := http.NewRequest("POST", url, strings.NewReader(payload))
 
 	for k, v := range headers {
 		req.Header.Set(k, v)
@@ -286,19 +239,19 @@ func (auth *Authenticator) partFour(state string) Error {
 
 	resp, err := auth.Session.Do(req)
 	if err != nil {
-		return *NewError("part_four", 0, "", err)
+		return NewError("part_four", 0, "Failed to send request", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode == 302 || resp.StatusCode == 200 {
-		return auth.partFive(state)
+		return auth.partFour(state)
 	} else {
-		err := NewError("__part_four", resp.StatusCode, "Your email address is invalid.", fmt.Errorf("error: Check details"))
-		return *err
+		return NewError("__part_four", resp.StatusCode, "Your email address is invalid.", fmt.Errorf("error: Check details"))
+
 	}
 
 }
-func (auth *Authenticator) partFive(state string) Error {
+func (auth *Authenticator) partFour(state string) *Error {
 
 	url := fmt.Sprintf("https://auth0.openai.com/u/login/password?state=%s", state)
 	emailURLEncoded := auth.URLEncode(auth.EmailAddress)
@@ -316,10 +269,7 @@ func (auth *Authenticator) partFive(state string) Error {
 		"Content-Type":    "application/x-www-form-urlencoded",
 	}
 
-	req, err := http.NewRequest("POST", url, strings.NewReader(payload))
-	if err != nil {
-		return *NewError("part_five", 0, "", err)
-	}
+	req, _ := http.NewRequest("POST", url, strings.NewReader(payload))
 
 	for k, v := range headers {
 		req.Header.Set(k, v)
@@ -327,25 +277,22 @@ func (auth *Authenticator) partFive(state string) Error {
 
 	resp, err := auth.Session.Do(req)
 	if err != nil {
-		return *NewError("part_five", 0, "", err)
+		return NewError("part_five", 0, "Failed to send request", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode == 302 {
 		redirectURL := resp.Header.Get("Location")
-		return auth.partSix(state, redirectURL)
+		return auth.partFive(state, redirectURL)
 	} else {
 		body := bytes.NewBuffer(nil)
-		_, err1 := body.ReadFrom(resp.Body)
-		if err1 != nil {
-			return *NewError("part_five", 0, "", err1)
-		}
-		err := NewError("__part_five", resp.StatusCode, body.String(), fmt.Errorf("error: Check details"))
-		return *err
+		body.ReadFrom(resp.Body)
+		return NewError("__part_five", resp.StatusCode, body.String(), fmt.Errorf("error: Check details"))
+
 	}
 
 }
-func (auth *Authenticator) partSix(oldState string, redirectURL string) Error {
+func (auth *Authenticator) partFive(oldState string, redirectURL string) *Error {
 
 	url := "https://auth0.openai.com" + redirectURL
 
@@ -358,10 +305,7 @@ func (auth *Authenticator) partSix(oldState string, redirectURL string) Error {
 		"Referer":         fmt.Sprintf("https://auth0.openai.com/u/login/password?state=%s", oldState),
 	}
 
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return *NewError("part_six", 0, "", err)
-	}
+	req, _ := http.NewRequest("GET", url, nil)
 
 	for k, v := range headers {
 		req.Header.Set(k, v)
@@ -369,89 +313,105 @@ func (auth *Authenticator) partSix(oldState string, redirectURL string) Error {
 
 	resp, err := auth.Session.Do(req)
 	if err != nil {
-		return *NewError("part_six", 0, "", err)
+		return NewError("part_six", 0, "Failed to send request", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode == 302 {
-		redirectURL := resp.Header.Get("Location")
-		return auth.partSeven(redirectURL, url)
+		auth.URL = resp.Header.Get("Location")
+		return auth.partSix()
 	} else {
-		err := NewError("__part_six", resp.StatusCode, resp.Status, fmt.Errorf("error: Check details"))
-		return *err
+		return NewError("__part_six", resp.StatusCode, resp.Status, fmt.Errorf("error: Check details"))
+
 	}
 
 }
-func (auth *Authenticator) partSeven(redirectURL string, previousURL string) Error {
-
-	url := redirectURL
-
-	headers := map[string]string{
-		"Host":            "chat.openai.com",
-		"Accept":          "application/json",
-		"Connection":      "keep-alive",
-		"User-Agent":      auth.UserAgent,
-		"Accept-Language": "en-GB,en-US;q=0.9,en;q=0.8",
-		"Referer":         previousURL,
+func (auth *Authenticator) partSix() *Error {
+	code := regexp.MustCompile(`code=(.*)&`).FindStringSubmatch(auth.URL)
+	if len(code) == 0 {
+		return NewError("__get_access_token", 0, auth.URL, fmt.Errorf("error: Check details"))
 	}
+	payload, _ := json.Marshal(map[string]string{
+		"redirect_uri":  "com.openai.chat://auth0.openai.com/ios/com.openai.chat/callback",
+		"grant_type":    "authorization_code",
+		"client_id":     "pdlLIX2Y72MIl2rhLhTE9VV9bN905kBh",
+		"code":          code[1],
+		"code_verifier": auth.Verifier_code,
+		"state":         auth.State,
+	})
 
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return *NewError("part_seven", 0, "", err)
-	}
-
-	for k, v := range headers {
+	req, _ := http.NewRequest("POST", "https://auth0.openai.com/oauth/token", strings.NewReader(string(payload)))
+	for k, v := range map[string]string{
+		"User-Agent":   auth.UserAgent,
+		"content-type": "application/json",
+	} {
 		req.Header.Set(k, v)
 	}
-
 	resp, err := auth.Session.Do(req)
 	if err != nil {
-		return *NewError("part_seven", 0, "", err)
+		return NewError("get_access_token", 0, "Failed to send request", err)
 	}
 	defer resp.Body.Close()
+	// Parse response
+	body, _ := io.ReadAll(resp.Body)
+	// Parse as JSON
+	var data map[string]interface{}
 
-	if resp.StatusCode == 200 || resp.StatusCode == 302 {
-		return Error{}
-	} else {
-		body, err := io.ReadAll(resp.Body)
-		if err != nil {
-			return *NewError("part_seven", 0, "", err)
-		}
-		return *NewError("__part_seven", resp.StatusCode, string(body), fmt.Errorf("error: Check details"))
+	err = json.Unmarshal(body, &data)
+
+	if err != nil {
+		return NewError("get_access_token", 0, "Response was not JSON", err)
 	}
+
+	// Check if access token in data
+	if _, ok := data["access_token"]; !ok {
+		return NewError("get_access_token", 0, "Missing access token", fmt.Errorf("error: Check details"))
+	}
+	auth.AuthResult.AccessToken = data["access_token"].(string)
+	auth.AuthResult.RefreshToken = data["refresh_token"].(string)
+
+	return nil
 }
-func (auth *Authenticator) GetAccessToken() (string, Error) {
-	url := "https://chat.openai.com/api/auth/session"
 
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return "", *NewError("get_access_token", 0, "", err)
+func (auth *Authenticator) GetAccessToken() string {
+	return auth.AuthResult.AccessToken
+}
+
+func (auth *Authenticator) GetPUID() (string, *Error) {
+	// Check if user has access token
+	if auth.AuthResult.AccessToken == "" {
+		return "", NewError("get_puid", 0, "Missing access token", fmt.Errorf("error: Check details"))
 	}
-	// Set user agent
-	req.Header.Set("User-Agent", auth.UserAgent)
+	// Make request to https://chat.openai.com/backend-api/models
+	req, _ := http.NewRequest("GET", "https://chat.openai.com/backend-api/models", nil)
+	// Add headers
+	req.Header.Add("Authorization", "Bearer "+auth.AuthResult.AccessToken)
+	req.Header.Add("User-Agent", auth.UserAgent)
+	req.Header.Add("Accept", "application/json")
+	req.Header.Add("Accept-Language", "en-US,en;q=0.9")
+	req.Header.Add("Referer", "https://chat.openai.com/")
+	req.Header.Add("Origin", "https://chat.openai.com")
+	req.Header.Add("Connection", "keep-alive")
 
 	resp, err := auth.Session.Do(req)
 	if err != nil {
-		return "", *NewError("get_access_token", 0, "", err)
+		return "", NewError("get_puid", 0, "Failed to make request", err)
 	}
 	defer resp.Body.Close()
-
-	if resp.StatusCode == 200 {
-		var result map[string]interface{}
-		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-			return "", *NewError("get_access_token", 0, "", err)
-		}
-		if result["accessToken"] == nil {
-			return "", *NewError("get_access_token", 0, "", fmt.Errorf("error: accessToken is nil"))
-		}
-
-		auth.AccessToken = result["accessToken"].(string)
-		return auth.AccessToken, Error{}
-	} else {
-		body, err := io.ReadAll(resp.Body)
-		if err != nil {
-			return "", *NewError("get_access_token", 0, "", err)
-		}
-		return "", *NewError("get_access_token", resp.StatusCode, string(body), fmt.Errorf("error: Check details"))
+	if resp.StatusCode != 200 {
+		return "", NewError("get_puid", resp.StatusCode, "Failed to make request", fmt.Errorf("error: Check details"))
 	}
+	// Find `_puid` cookie in response
+	for _, cookie := range resp.Cookies() {
+		if cookie.Name == "_puid" {
+			auth.AuthResult.PUID = cookie.Value
+			return cookie.Value, nil
+		}
+	}
+	// If cookie not found, return error
+	return "", NewError("get_puid", 0, "PUID cookie not found", fmt.Errorf("error: Check details"))
+}
+
+func (auth *Authenticator) GetAuthResult() AuthResult {
+	return auth.AuthResult
 }
