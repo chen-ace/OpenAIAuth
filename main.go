@@ -49,7 +49,7 @@ func getToken(username string, password string) string {
 	result := auth.GetAuthResult()
 	result_json, _ := json.Marshal(result)
 	println(string(result_json))
-	return token
+	return string(result_json)
 }
 
 func main() {
